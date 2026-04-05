@@ -10,7 +10,7 @@ from typing import Optional
 import pandas as pd
 
 DATA_DIR = "./data"
-ACTION_LOG = "./vm_action_log.csv"
+ACTION_LOG = "./vm_action_log.csv" # appends on each run, does not overwrite
 
 
 # --- tool 1: get_store_layout ---
