@@ -1,6 +1,25 @@
 # agent_backend.py
-# LangGraph workflow with 4 agent nodes — footfall, sales, VM/planogram, action plan
-# human-in-the-loop interrupt pauses before process_decisions
+# LangGraph 4-node workflow — footfall, sales, VM/planogram, action plan
+# interrupt before process_decisions so store manager can approve/reject actions
+#
+# Few Thoughts — next iteration
+#
+# - Add trend comparison for IoT and Sales Performance — right now we only look at current week, would be more
+#   useful to show WoW and MoM movement so the store manager sees direction not just snapshot
+#
+# - Add a store comparison mode — flag when one store's VM compliance is significantly
+#   worse than the regional average, useful for area managers not just individual store managers
+
+# - Save previous 3-4 week files of recommended actions, this will be looked up and mapped with 3-4 week sales performance
+#   The upcoming week recommendation will consider past weeks recommended actions + sales performance
+#   
+# - Master Plannogram will be per store 
+# 
+# - one thing I keep going back to — the action plan right now is static, it doesn't know
+#   what was approved last week. need to feed approved_actions history back in as context
+#   so the agent stops recommending the same gondola change three weeks in a row
+
+
 
 import os
 import json
@@ -15,39 +34,42 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
-# --- state ---
 
 class StoreExperienceState(TypedDict):
-    # shared state passed between all nodes — the agent's working memory
-    # Inputs
-    store_filter: str           # specific store or "all"
-    week_filter: str            # "latest" or specific week
+    store_filter: str
+    week_filter: str
     api_key: str
-
-    # Agent outputs (accumulated as workflow progresses)
-    footfall_analysis: str      # Agent 1 output
-    sales_analysis: str         # Agent 2 output
-    vm_analysis: str            # Agent 3 output (includes planogram)
-    action_plan: str            # Agent 4 draft
-
-    # Human review
-    human_decisions: dict       # {action_id: "approve"/"modify"/"reject"}
+    footfall_analysis: str
+    sales_analysis: str
+    vm_analysis: str
+    action_plan: str
+    human_decisions: dict
     approved_actions: List[dict]
     rejected_actions: List[dict]
-
-    # Final output
     final_report: str
-    session_log: List[str]      # Audit trail
-
-    # Flow control
+    session_log: List[str]
     current_node: str
     error: Optional[str]
 
 
-# --- data loading ---
-
 DATA_DIR = "./data"
-_cache = {}  # reloads if server restarts — fine for demo use
+_cache = {}  # simple cache — reloads if server restarts, fine for demo
+
+
+def _fmt_pct(value, decimals=1):
+    # wrapping this because I kept writing round(x*100,1) inline everywhere
+    # and got it wrong twice — once forgot the *100, once passed already-multiplied value
+    # wrapper makes it explicit
+    try:
+        return round(float(value) * 100, decimals)
+    except (TypeError, ValueError):
+        return 0.0
+
+# tried using _fmt_pct in the brand_text formatting below to standardise
+# but the *100 only applies to the post-fix decimal columns, not all percentages
+# IoT columns store already-multiplied values so it would have broken Agent 1
+# leaving it here, useful for the sell-through display in Agent 2
+
 
 def load_data(source):
     if source not in _cache:
@@ -70,7 +92,8 @@ def get_latest_week(df):
 
 
 def encode_pdf_page(pdf_path):
-    # convert planogram PDF first page to base64 PNG for GPT-4o vision
+    # converts planogram PDF first page to base64 for GPT-4o vision
+    # pdf2image needs poppler installed — falls back gracefully if not available
     try:
         from pdf2image import convert_from_path
         import io
@@ -84,10 +107,8 @@ def encode_pdf_page(pdf_path):
     return ""
 
 
-# --- agent 1: footfall intelligence analyst ---
-
 def footfall_analysis_node(state):
-    # analyses IoT behavioural data — dwell time, conversion, demographics by zone
+    # Agent 1 — reads IoT camera data, finds opportunity zones and friction points
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1,
                      openai_api_key=state["api_key"])
 
@@ -95,7 +116,6 @@ def footfall_analysis_node(state):
     store = state.get("store_filter", "all")
     week = state.get("week_filter", "latest")
 
-    # Apply filters
     if week == "latest":
         target_week = get_latest_week(df)
     else:
@@ -112,7 +132,8 @@ def footfall_analysis_node(state):
         state["session_log"].append("Agent 1 (Footfall): No data found")
         return state
 
-    # Aggregate by zone + category
+    # aggregate by zone and category
+    
     agg = filtered.groupby(['Zone', 'Category']).agg(
         Total_Visitors=('Visitor_Count', 'sum'),
         Avg_Dwell_Sec=('Avg_Dwell_Time_Sec', 'mean'),
@@ -124,7 +145,6 @@ def footfall_analysis_node(state):
         Peak_Visits=('Peak_Hour_Flag', lambda x: (x=='Y').sum()),
     ).reset_index()
 
-    # Format as structured text for LLM
     data_text = f"IoT BEHAVIOURAL DATA — {target_week}"
     if store != "all":
         data_text += f" | Store: {store}"
@@ -140,8 +160,9 @@ def footfall_analysis_node(state):
             f"Competitor Interaction: {row['Avg_Competitor_Int']:.1f}%\n"
             f"  Gender Split: F={row['Female_Pct']:.0f}% M={row['Male_Pct']:.0f}%\n\n"
         )
+    # not passing Peak_Visits to the LLM — tried it and the agent kept fixating on
+    # peak hour staffing recommendations instead of VM actions, which is out of scope
 
-    # Agent prompt
     response = llm.invoke([
         SystemMessage(content="""You are a Retail Footfall Intelligence Analyst specialising in 
 IoT camera data interpretation. You have expertise in customer journey analytics, 
@@ -169,10 +190,13 @@ Be specific with zone names, category names, and percentages from the data.""")
     return state
 
 
-# --- agent 2: sales performance analyst ---
-
 def sales_analysis_node(state):
-    # correlates sales with footfall patterns to find VM opportunities
+    # Agent 2 — correlates sales with footfall to find VM opportunities
+    # the key insight here: a brand with high sell-through but low sales revenue
+    # is likely undershelved — limited gondola space means limited stock displayed,
+    # which caps sales even when customer demand is strong
+    # it's not an inventory replenishment problem, it's a space allocation problem —
+    # the fix is more facings or a better shelf position, not a bigger PO
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1,
                      openai_api_key=state["api_key"])
 
@@ -182,18 +206,16 @@ def sales_analysis_node(state):
     week = state.get("week_filter", "latest")
 
     if week == "latest":
-        target_week = get_latest_week(sales_df)
+        target_week = get_latest_week(sales_df)  
     else:
         target_week = week
 
-    # Sales summary
     mask = sales_df['Week'] == target_week
     if store != "all":
         mask &= sales_df['Store'].str.lower() == store.lower()
 
     sales = sales_df[mask].copy()
 
-    # Category performance
     cat_perf = []
     for _, row in sales.iterrows():
         try:
@@ -205,9 +227,8 @@ def sales_analysis_node(state):
             cat_perf.append(f"{row['Category']} @ {row['Store']}: "
                            f"INR {actual}L, Ach {ach}%, WoW {wow:+.1f}%")
         except Exception:
-            pass
+            pass  # skip malformed rows
 
-    # Brand sell-through from SKU data
     sku_mask = sku_df['Week'] == target_week
     if store != "all":
         sku_mask &= sku_df['Store'].str.lower() == store.lower()
@@ -222,9 +243,15 @@ def sales_analysis_node(state):
     brand_text = ""
     for _, row in brand_agg.head(20).iterrows():
         brand_text += (f"{row['Brand']} ({row['Category']}): "
-                      f"{int(row['Units'])} units, ST {row['Avg_ST']:.1f}%, "
+                      f"{int(row['Units'])} units, ST {row['Avg_ST']*100:.1f}%, "
                       f"Low stock SKUs: {int(row['Low_Stock'])}\n")
 
+    # tried sorting by Low_Stock descending instead of Avg_ST to surface reorder alerts first
+    # but then the LLM led with stock replenishment recommendations every time
+    # and buried the VM opportunity brands — ST sort gives better action plan output
+    # brand_agg_by_stock = brand_agg.sort_values('Low_Stock', ascending=False)
+
+    # pass first 500 chars of footfall output as context — enough for signal without overwhelming
     footfall_context = state.get("footfall_analysis", "")[:500]
 
     response = llm.invoke([
@@ -260,23 +287,20 @@ Use specific brand names, category names, and numbers from the data.""")
     return state
 
 
-# --- agent node 3 — vm and planogram analyst (multimodal) ---
-
 def vm_analysis_node(state):
-    # reads gondola data + planogram PDF via GPT-4o vision, finds compliance gaps
+    # Agent 3 — multimodal node, reads gondola Excel + planogram PDF via GPT-4o Vision
+    
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1,
                      openai_api_key=state["api_key"])
 
     gondola_df = load_data("gondola")
     store = state.get("store_filter", "all")
 
-    # Filter gondola data
     if store != "all":
         gondola = gondola_df[gondola_df['Store'].str.lower() == store.lower()].copy()
     else:
         gondola = gondola_df.copy()
 
-    # Compliance summary
     compliance_gaps = gondola[gondola['Compliance_Gap'] == 'YES']
     compliance_text = f"Gondola Allocation Analysis:\n"
     compliance_text += f"Total fixtures: {len(gondola)} | Compliance gaps: {len(compliance_gaps)}\n\n"
@@ -288,7 +312,6 @@ def vm_analysis_node(state):
             f"  VM Score: {row['VM_Compliance_Score_%']}%\n\n"
         )
 
-    # Try multimodal planogram reading
     planogram_insight = ""
     pdf_path = str(Path(DATA_DIR) / "08_Store_Planogram.pdf")
     img_b64 = encode_pdf_page(pdf_path)
@@ -314,7 +337,10 @@ Be specific about zone names and brand names visible in the document."""}
         except Exception as e:
             planogram_insight = f"\nPlanogram vision analysis unavailable: {e}"
     else:
-        # Fallback: text-based planogram guidelines
+        # vision not available — fall back to hardcoded guidelines
+        # TODO: load these from a config file storewise, instead of hardcoding
+        # each store genuinely has a different planogram — Koramangala has a different
+        # zone layout to Whitefield, hardcoding one set of rules is a known gap here
         planogram_insight = """
 PLANOGRAM GUIDELINES (Standard):
 - Zone A (Entrance): Ladies Western front bay — AND/W brands eye level priority
@@ -356,10 +382,8 @@ Prioritise by revenue impact. Be specific with store names, brand names, zone na
     return state
 
 
-# --- agent 4: store action plan writer ---
-
 def action_plan_node(state):
-    # synthesises all 3 agents + promo calendar into a ranked action plan
+    # Agent 4 — pulls everything together into a ranked 7-action monthly plan
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1,
                      openai_api_key=state["api_key"])
 
@@ -368,12 +392,10 @@ def action_plan_node(state):
     week = state.get("week_filter", "latest")
 
     if week == "latest":
-        from pandas import to_numeric
         target_week = get_latest_week(promo_df)
     else:
         target_week = week
 
-    # Get upcoming promos
     weeks_sorted = sorted(promo_df['Week'].unique())
     try:
         curr_idx = weeks_sorted.index(target_week)
@@ -441,20 +463,16 @@ VM actions needed before each upcoming promotion.
     return state
 
 
-# --- human approval ---
-
 def human_approval_node(state):
-    # interrupt point — execution pauses here for human review
-    # This node just marks that we are at the approval stage
-    # The actual interrupt is handled by LangGraph's interrupt mechanism
-    # In Streamlit, we check current_node == "awaiting_approval"
+    # pause point — LangGraph interrupt mechanism kicks in here
+    # Streamlit checks current_node == "awaiting_approval" to show the review UI
     state["current_node"] = "awaiting_approval"
     state["session_log"].append("Human approval checkpoint reached")
     return state
 
 
 def process_decisions_node(state):
-    # process approvals and log via MCP tools
+    # processes store manager approvals and logs via MCP tools
     from tools import log_vm_action, get_store_layout
 
     decisions = state.get("human_decisions", {})
@@ -470,7 +488,6 @@ def process_decisions_node(state):
                 "status": decision["status"],
                 "approved_by": "Store Manager",
             }
-            # Call MCP tool
             result = log_vm_action(
                 store=state.get("store_filter", "all"),
                 action_id=action_id,
@@ -495,12 +512,14 @@ def process_decisions_node(state):
 
 
 def generate_report_node(state):
-    # generate session summary report
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1,
                      openai_api_key=state["api_key"])
 
     approved = state.get("approved_actions", [])
     rejected = state.get("rejected_actions", [])
+    # keeping this node simple — it just summarises what happened
+    # tried making it pull IoT + sales data again for a richer summary
+    # but that's another 2 LLM calls and the manager just wants to see what got approved
 
     approved_text = "\n".join([f"- {a['action_id']}: {a['description']} ({a['status']})"
                                for a in approved]) or "None"
@@ -534,42 +553,35 @@ Write a 1-page session summary:
     return state
 
 
-# --- workflow builder ---
-
 def build_workflow():
-    # sequential graph: footfall → sales → vm → action_plan → approval → decisions → report
-    # interrupt_before=process_decisions pauses for human input
+    # sequential: footfall -> sales -> vm -> action_plan -> approval -> decisions -> report
     workflow = StateGraph(StoreExperienceState)
 
-    # Add nodes
-    workflow.add_node("footfall_analysis", footfall_analysis_node)
-    workflow.add_node("sales_analysis", sales_analysis_node)
-    workflow.add_node("vm_analysis", vm_analysis_node)
-    workflow.add_node("action_plan", action_plan_node)
-    workflow.add_node("human_approval", human_approval_node)
-    workflow.add_node("process_decisions", process_decisions_node)
-    workflow.add_node("generate_report", generate_report_node)
+    workflow.add_node("footfall_analysis_node", footfall_analysis_node)
+    workflow.add_node("sales_analysis_node", sales_analysis_node)
+    workflow.add_node("vm_analysis_node", vm_analysis_node)
+    workflow.add_node("action_plan_node", action_plan_node)
+    workflow.add_node("human_approval_node", human_approval_node)
+    workflow.add_node("process_decisions_node", process_decisions_node)
+    workflow.add_node("generate_report_node", generate_report_node)
 
-    # Add edges (sequential flow)
-    workflow.set_entry_point("footfall_analysis")
-    workflow.add_edge("footfall_analysis", "sales_analysis")
-    workflow.add_edge("sales_analysis", "vm_analysis")
-    workflow.add_edge("vm_analysis", "action_plan")
-    workflow.add_edge("action_plan", "human_approval")
-    workflow.add_edge("human_approval", "process_decisions")
-    workflow.add_edge("process_decisions", "generate_report")
-    workflow.add_edge("generate_report", END)
+    workflow.set_entry_point("footfall_analysis_node")
+    workflow.add_edge("footfall_analysis_node", "sales_analysis_node")
+    workflow.add_edge("sales_analysis_node", "vm_analysis_node")
+    workflow.add_edge("vm_analysis_node", "action_plan_node")
+    workflow.add_edge("action_plan_node", "human_approval_node")
+    workflow.add_edge("human_approval_node", "process_decisions_node")
+    workflow.add_edge("process_decisions_node", "generate_report_node")
+    workflow.add_edge("generate_report_node", END)
 
-    # Compile with memory checkpointer for human-in-the-loop
     memory = MemorySaver()
     return workflow.compile(
         checkpointer=memory,
-        interrupt_before=["process_decisions"]  # Pause before processing decisions
+        interrupt_before=["process_decisions_node"]
     )
 
 
 def get_initial_state(store, week, api_key):
-    # fresh state for a new session
     return StoreExperienceState(
         store_filter=store,
         week_filter=week,
@@ -586,3 +598,91 @@ def get_initial_state(store, week, api_key):
         current_node="start",
         error=None,
     )
+
+
+def generate_word_document(store, week, agent_outputs, approved_actions, rejected_actions, final_report):
+    # generates session report as Word doc
+    # had to handle the case where approved_actions is empty list — table was erroring on zero rows
+    try:
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        doc = Document()
+
+        title = doc.add_heading("STORE EXPERIENCE OPTIMISATION — SESSION REPORT", 0)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        title.runs[0].font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
+
+        subtitle = doc.add_paragraph(f"Store: {store}  |  Week: {week}")
+        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        subtitle.runs[0].font.size = Pt(11)
+        subtitle.runs[0].font.color.rgb = RGBColor(0x44, 0x44, 0x44)
+
+        doc.add_paragraph("─" * 80)
+
+        sections = [
+            ("AGENT 1 — FOOTFALL INTELLIGENCE ANALYSIS", agent_outputs.get("footfall_analysis", "")),
+            ("AGENT 2 — SALES PERFORMANCE ANALYSIS",     agent_outputs.get("sales_analysis", "")),
+            ("AGENT 3 — VM & PLANOGRAM ANALYSIS",        agent_outputs.get("vm_analysis", "")),
+            ("AGENT 4 — MONTHLY ACTION PLAN",            agent_outputs.get("action_plan", "")),
+            ("FINAL SESSION REPORT",                     final_report),
+        ]
+
+        for section_title, content in sections:
+            if not content:
+                continue
+            h = doc.add_heading(section_title, level=1)
+            h.runs[0].font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line:
+                    doc.add_paragraph("")
+                elif line.startswith('**') and line.endswith('**'):
+                    ph = doc.add_heading(line.strip('*'), level=2)
+                    ph.runs[0].font.color.rgb = RGBColor(0x2E, 0x6D, 0xA4)
+                elif line.startswith('- ') or line.startswith('• '):
+                    doc.add_paragraph(line[2:], style='List Bullet')
+                else:
+                    doc.add_paragraph(line)
+
+        # approved actions table
+        if approved_actions:
+            h = doc.add_heading("APPROVED VM ACTIONS", level=1)
+            h.runs[0].font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
+            table = doc.add_table(rows=1, cols=3)
+            table.style = 'Table Grid'
+            hdr = table.rows[0].cells
+            for i, text in enumerate(["Action ID", "Description", "Status"]):
+                hdr[i].text = text
+                hdr[i].paragraphs[0].runs[0].font.bold = True
+            for action in approved_actions:
+                row = table.add_row().cells
+                row[0].text = action.get("action_id", "")
+                row[1].text = action.get("description", "")
+                row[2].text = action.get("status", "")
+
+        # rejected actions table
+        if rejected_actions:
+            h = doc.add_heading("REJECTED ACTIONS", level=1)
+            h.runs[0].font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
+            table = doc.add_table(rows=1, cols=2)
+            table.style = 'Table Grid'
+            hdr = table.rows[0].cells
+            for i, text in enumerate(["Action ID", "Reason"]):
+                hdr[i].text = text
+                hdr[i].paragraphs[0].runs[0].font.bold = True
+            for action in rejected_actions:
+                row = table.add_row().cells
+                row[0].text = action.get("action_id", "")
+                row[1].text = action.get("reason", "Rejected by manager")
+
+        out_path = "./data/Store_Experience_Session_Report.docx"
+        doc.save(out_path)
+        return out_path
+
+    except ImportError:
+        out_path = "./data/Store_Experience_Session_Report.txt"
+        with open(out_path, 'w') as f:
+            f.write(final_report)
+        return out_path

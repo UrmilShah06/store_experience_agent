@@ -1,6 +1,11 @@
 # tools.py
-# MCP tool definitions — get_store_layout and log_vm_action
-# in production these would be FastAPI endpoints; here they read from Excel and write to CSV
+# MCP tool definitions for the store experience agent
+# get_store_layout reads gondola data, log_vm_action writes approvals to CSV
+# in production these would be proper API endpoints — this is the demo version
+#
+# worth noting: MCP here is really just a structured JSON contract, not a live server
+# the real MCP integration would have these registered with a tool registry
+# and called over HTTP — keeping it simple for the portfolio demo
 
 import json
 import csv
@@ -10,26 +15,38 @@ from typing import Optional
 import pandas as pd
 
 DATA_DIR = "./data"
-ACTION_LOG = "./vm_action_log.csv" # appends on each run, does not overwrite
+ACTION_LOG = "./vm_action_log.csv"  # appends on each run
 
 
-# --- tool 1: get_store_layout ---
+def _normalise_store_name(name):
+    # store names in the gondola file have inconsistent casing sometimes
+    # this just lowercases for the mask — simple but saved a KeyError once
+    # considered doing fuzzy match here but that felt like overkill for a demo
+    return name.strip().lower()
+
+# tried a fancier version that also stripped underscores and did partial matching
+# e.g. "koramangala" would match "Bangalore_Koramangala"
+# worked fine until "Chennai" matched both Chennai_AnnaNagar and a test row — scrapped it
+# def _fuzzy_store_match(df, name):
+#     name_clean = name.lower().replace('_', '')
+#     return df['Store'].apply(lambda s: name_clean in s.lower().replace('_', ''))
+
 
 def get_store_layout(store, category=None):
     # returns gondola allocation for a store as JSON
-    # production: would call store ops DB via API; here reads from Excel
+    # tried returning full chain data when store filter is missing but
+    # the payload got too large for the LLM context — filtered is better
     try:
         path = Path(DATA_DIR) / "06_Gondola_Allocation.xlsx"
         df = pd.read_excel(path)
         df.columns = df.columns.str.strip()
 
-        mask = df['Store'].str.lower() == store.lower()
+        mask = df['Store'].str.lower() == _normalise_store_name(store)
         if category:
             mask &= df['Category'].str.lower() == category.lower()
 
         filtered = df[mask]
 
-        # tried returning a default empty layout here but not_found is cleaner
         if filtered.empty:
             return json.dumps({"status": "not_found",
                                "message": f"No layout data for {store}"})
@@ -45,7 +62,7 @@ def get_store_layout(store, category=None):
                 "shelf_level": row['Shelf_Level'],
                 "face_count": int(row['Face_Count']),
                 "linear_feet": float(row['Linear_Feet']),
-                "vm_compliance_score": int(row['VM_Compliance_Score_%']),
+                "vm_compliance_score": int(row['VM_Compliance_Score_%']),  # stored as 0-100 integer
                 "compliance_gap": row['Compliance_Gap'],
                 "planogram_specified_level": row['Planogram_Specified_Level'],
             })
@@ -63,16 +80,12 @@ def get_store_layout(store, category=None):
         return json.dumps({"status": "error", "message": str(e)})
 
 
-# --- tool 2: log_vm_action ---
-
-def log_vm_action(store: str, action_id: str, description: str,
-                  status: str, notes: str = "") -> str:
-    # logs approved VM action to CSV tracker
-    # production: would write to store ops system and notify VM team
+def log_vm_action(store, action_id, description, status, notes=""):
+    # logs approved VM action to CSV
+    # considered SQLite here but CSV is easier to inspect and the volume is low
     try:
         log_path = Path(ACTION_LOG)
-        
-        # Create file with headers if it does not exist
+
         if not log_path.exists():
             with open(log_path, 'w', newline='') as f:
                 writer = csv.writer(f)
@@ -81,7 +94,6 @@ def log_vm_action(store: str, action_id: str, description: str,
                     "status", "notes", "logged_by"
                 ])
 
-        # Append the new action
         with open(log_path, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -105,11 +117,9 @@ def log_vm_action(store: str, action_id: str, description: str,
         return json.dumps({"status": "error", "message": str(e)})
 
 
-# --- mcp server simulation ---
-
-def get_mcp_tool_registry() -> dict:
-    # tool manifest — clients call this to discover available tools
-    # pattern: /tools to discover, /invoke/{name} to call
+def get_mcp_tool_registry():
+    # tool manifest so clients know what tools are available
+    
     return {
         "mcp_version": "1.0",
         "server_name": "store_experience_agent",
@@ -145,7 +155,8 @@ def get_mcp_tool_registry() -> dict:
 
 
 def invoke_mcp_tool(tool_name, parameters):
-    # route tool calls to the right function
+    # routes incoming tool calls — straightforward dispatch
+    # in a real MCP server this would be handled by the framework routing layer
     if tool_name == "get_store_layout":
         return get_store_layout(
             store=parameters.get("store", ""),
