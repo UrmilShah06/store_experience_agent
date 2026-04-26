@@ -285,6 +285,7 @@ with tab_report:
     else:
         st.markdown("<div style='background:#0d3320;border:1px solid #1a6640;border-radius:8px;padding:0.7rem 1rem;margin-bottom:1rem;'><span style='color:#4caf7d;font-weight:600;'>✅ Workflow Complete</span></div>", unsafe_allow_html=True)
         from agent_backend import generate_word_document
+        #st.write(st.session_state.agent_outputs)
         docx_path = generate_word_document(
             store=st.session_state.store_filter,
             week=st.session_state.week_filter,

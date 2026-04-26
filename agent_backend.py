@@ -634,7 +634,8 @@ def generate_word_document(store, week, agent_outputs, approved_actions, rejecte
                 continue
             h = doc.add_heading(section_title, level=1)
             h.runs[0].font.color.rgb = RGBColor(0x1F, 0x38, 0x64)
-            for line in content.split('\n'):
+            #for line in content.split('\n'):
+            for line in content.replace('\\n', '\n').split('\n'):
                 line = line.strip()
                 if not line:
                     doc.add_paragraph("")
